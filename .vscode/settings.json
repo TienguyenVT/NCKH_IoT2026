@@ -5,7 +5,7 @@
     "board/esp32s3-builtin.cfg"
   ],
   "idf.portWin": "detect",
-  "idf.currentSetup": "D:\\.espressif\\v5.5.3\\esp-idf",
+  "idf.currentSetup": "e:\\deadline\\container\\v5.5.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
