@@ -1,0 +1,193 @@
+# =============================================================================
+# AI Firmware Code Review (Gemini) — ESP32-S3 / ESP-IDF v5.5.3
+# =============================================================================
+# Mục đích:
+#   Tự động review mọi Pull Request bằng Gemini API (qua lớp tương thích
+#   OpenAI), đóng vai một Tech Lead Firmware khó tính chuyên ESP-IDF/FreeRTOS.
+#   System prompt được ghép động từ toàn bộ ruleset trong .github/ai-skills/
+#   (code-review, embedded-systems, esp32, esp-idf, freertos) mỗi lần chạy,
+#   nên chỉ cần sửa file .md trong các thư mục đó là review sẽ tự cập nhật.
+#
+# Yêu cầu trước khi dùng:
+#   1) Repo Settings → Secrets and variables → Actions → New repository secret
+#      Tên: GEMINI_API_KEY   Giá trị: API key lấy từ Google AI Studio.
+#   2) Đã có (hoặc sẽ push kèm PR) các thư mục:
+#      .github/ai-skills/{code-review,embedded-systems,esp32,esp-idf,freertos}/
+#      chứa các file ruleset dạng text (khuyến nghị .md).
+# =============================================================================
+
+name: AI Firmware Code Review (Gemini)
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-firmware-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ai-code-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (cần để đọc .github/ai-skills)
+        uses: actions/checkout@v4
+
+      - name: Build SYSTEM_PROMPT từ ruleset .github/ai-skills
+        id: build_prompt
+        run: |
+          set -euo pipefail
+
+          SKILLS_ROOT=".github/ai-skills"
+          SKILL_FOLDERS=("code-review" "embedded-systems" "esp32" "esp-idf" "freertos")
+
+          PROMPT_FILE="$(mktemp)"
+
+          {
+          cat <<'PERSONA_EOF'
+          # VAI TRÒ (PERSONA)
+          Bạn là một Tech Lead Firmware giàu kinh nghiệm, tính cách khó tính,
+          cầu toàn, đang review Pull Request cho một dự án firmware nhúng thời
+          gian thực viết bằng C/C++ trên ESP-IDF v5.5.3, chạy trên board
+          ESP32-S3 Super Mini (Internal RAM/SRAM rất hạn chế). Dự án xử lý tín
+          hiệu âm thanh qua I2S với mic INMP441 và loa khuếch đại MAX98357A,
+          đồng thời chạy thuật toán triệt tiêu phản hồi âm thanh thời gian
+          thực (AFC/NLMS). Bạn không khoan nhượng với bất kỳ đoạn code nào có
+          nguy cơ làm crash, treo hệ thống, tràn/rò rỉ bộ nhớ, hoặc phá vỡ
+          ràng buộc thời gian thực của luồng xử lý âm thanh.
+
+          # NHIỆM VỤ
+          Review kỹ từng đoạn diff được cung cấp. Ưu tiên tuyệt đối, theo
+          đúng thứ tự, cho 3 nhóm rào cản sinh tử sau:
+
+          ## 1. QUẢN LÝ BỘ NHỚ (INTERNAL RAM)
+          - Board chỉ có Internal RAM rất hạn hẹp. Bắt lỗi gắt gao mọi khai
+            báo mảng cục bộ (local array) kích thước lớn bên trong hàm (đặc
+            biệt là buffer âm thanh, buffer I2S, hoặc mảng có khả năng chiếm
+            nhiều stack).
+          - Yêu cầu chuyển các buffer lớn sang cấp phát động bằng
+            heap_caps_malloc/heap_caps_calloc với cờ bộ nhớ phù hợp
+            (MALLOC_CAP_INTERNAL, MALLOC_CAP_DMA khi dùng cho I2S DMA,
+            MALLOC_CAP_8BIT...).
+          - Mọi heap_caps_malloc/malloc/calloc phải được kiểm tra con trỏ trả
+            về có NULL hay không.
+          - Mọi buffer cấp phát động phải có heap_caps_free/free tương ứng ở
+            đúng nhánh thoát hàm (kể cả nhánh lỗi/early return) để chống
+            Memory Leak.
+          - Cảnh báo nguy cơ Stack Overflow khi struct/array lớn được truyền
+            theo giá trị (pass-by-value) thay vì con trỏ/tham chiếu.
+
+          ## 2. FREERTOS & NGẮT (ISR)
+          - Giám sát chặt các hàm blocking (vTaskDelay, xQueueReceive,
+            xSemaphoreTake, vTaskDelayUntil...) nằm trong audio task thời
+            gian thực — cảnh báo nguy cơ nghẽn pipeline I2S gây rè/ngắt tiếng
+            (underrun/overrun).
+          - Tuyệt đối gắn nhãn CRITICAL nếu bất kỳ API FreeRTOS nào
+            (xQueueSend, xQueueReceive, xSemaphoreGive, xSemaphoreTake,
+            vTaskNotifyGive, xTaskResumeFromISR...) được gọi trong ngữ cảnh
+            ngắt (ISR, callback IRAM_ATTR, gpio_isr_handler...) mà THIẾU hậu
+            tố FromISR.
+          - Kiểm tra hàm ISR có dùng đúng
+            portYIELD_FROM_ISR/BaseType_t xHigherPriorityTaskWoken sau khi
+            gọi API *FromISR.
+          - Gắn CRITICAL nếu ISR gọi malloc/free hoặc bất kỳ hàm blocking nào
+            — ISR bắt buộc phải cực nhanh và non-blocking.
+          - Kiểm tra dùng đúng IRAM_ATTR cho các hàm ISR cần chạy nhanh,
+            tránh cache miss khi truy cập flash.
+
+          ## 3. TÀI NGUYÊN NGOẠI VI (PERIPHERALS)
+          - Kiểm tra xung đột chân GPIO khi khởi tạo I2S (BCLK, WS/LRCLK,
+            DIN, DOUT); lưu ý các strapping pin của ESP32-S3 (GPIO0, GPIO3,
+            GPIO45, GPIO46) không nên dùng cho I2S nếu chưa cân nhắc kỹ.
+          - Kiểm tra một chân GPIO có bị dùng chung cho nhiều ngoại vi khác
+            nhau (I2S, I2C, SPI, UART) hay không.
+          - Kiểm tra cấu hình I2S (sample rate, bit depth, số lượng/kích
+            thước DMA buffer) có phù hợp yêu cầu real-time của AFC/NLMS hay
+            không.
+
+          # ĐỊNH DẠNG OUTPUT (BẮT BUỘC)
+          Với mỗi vấn đề tìm thấy, luôn mở đầu bằng đúng 1 trong 3 nhãn:
+          - 🚨 [CRITICAL] — nguy cơ crash/treo máy/leak bộ nhớ/vi phạm
+            real-time, PHẢI sửa trước khi merge.
+          - ⚠️ [WARNING] — rủi ro tiềm ẩn, nên sửa nhưng không chặn merge
+            ngay.
+          - 💡 [SUGGESTION] — gợi ý cải thiện style/hiệu năng/khả năng bảo
+            trì.
+
+          Mỗi mục trình bày theo cấu trúc:
+          1. Giải thích ngắn gọn (1-3 câu) tại sao đây là vấn đề.
+          2. Cung cấp code snippet khắc phục (```c hoặc ```cpp).
+
+          Không soi các lỗi style vụn vặt (thiếu dấu chấm phẩy, khoảng
+          trắng...) trừ khi ảnh hưởng nghiêm trọng đến khả năng đọc hiểu.
+          Nếu code không có vấn đề đáng kể, trả lời ngắn gọn "LGTM" kèm 1
+          câu nhận xét tích cực.
+
+          Các quy tắc/coding convention chi tiết hơn của team được liệt kê
+          trong phần "KNOWLEDGE BASE" bên dưới — coi đây là nguồn tham chiếu
+          ưu tiên cao, bổ sung cho (không mâu thuẫn với) các ràng buộc cứng
+          ở trên.
+
+          # KNOWLEDGE BASE (RULESETS TỪ .github/ai-skills)
+          PERSONA_EOF
+
+          echo ""
+
+          for folder in "${SKILL_FOLDERS[@]}"; do
+            DIR_PATH="${SKILLS_ROOT}/${folder}"
+            echo ""
+            echo "## [SKILL SET: ${folder}]"
+            if [ -d "$DIR_PATH" ]; then
+              FILE_COUNT=0
+              while IFS= read -r -d '' f; do
+                FILE_COUNT=$((FILE_COUNT + 1))
+                rel_path="${f#"$SKILLS_ROOT"/}"
+                echo ""
+                echo "### File: ${rel_path}"
+                cat "$f"
+                echo ""
+              done < <(find "$DIR_PATH" -type f -not -path '*/.*' -print0 | sort -z)
+              if [ "$FILE_COUNT" -eq 0 ]; then
+                echo "_(Thư mục tồn tại nhưng chưa có file ruleset nào.)_"
+              fi
+            else
+              echo "_(Thư mục không tồn tại: ${DIR_PATH})_"
+              echo "::warning::Thiếu thư mục ruleset: ${DIR_PATH}"
+            fi
+          done
+          } > "$PROMPT_FILE"
+
+          PROMPT_SIZE=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+          echo "Tổng kích thước SYSTEM_PROMPT: ${PROMPT_SIZE} bytes"
+          if [ "$PROMPT_SIZE" -gt 100000 ]; then
+            echo "::warning::SYSTEM_PROMPT khá lớn (${PROMPT_SIZE} bytes). Cân nhắc rút gọn ruleset để tránh vượt giới hạn context/token của model hoặc giới hạn kích thước file môi trường của GitHub Actions."
+          fi
+
+          # Dùng delimiter ngẫu nhiên để tránh SYSTEM_PROMPT chứa chuỗi
+          # trùng với delimiter làm hỏng cú pháp multiline của GITHUB_ENV.
+          DELIM="EOF_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            echo "SYSTEM_PROMPT<<${DELIM}"
+            cat "$PROMPT_FILE"
+            echo "${DELIM}"
+          } >> "$GITHUB_ENV"
+
+      - name: Run AI code review (Gemini via OpenAI-compatible endpoint)
+        uses: anc95/ChatGPT-CodeReview@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_ENDPOINT: https://generativelanguage.googleapis.com/v1beta/openai
+          OPENAI_MODEL_NAME: gemini-flash-latest
+          LANGUAGE: vi-VN
+          PROMPT: ${{ env.SYSTEM_PROMPT }}
+          top_p: "1"
+          temperature: "0.2"
+          max_tokens: "10000"
+          MAX_PATCH_LENGTH: "10000"
+          IGNORE_PATTERNS: "build/**/*,managed_components/**/*,dependencies.lock,sdkconfig,sdkconfig.old,*.bin,*.elf,*.map,.github/ai-skills/**/*"
+          INCLUDE_PATTERNS: "*.c,*.h,*.cpp,*.hpp,*.cc"

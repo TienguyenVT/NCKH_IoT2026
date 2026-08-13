@@ -1,0 +1,44 @@
+name: Build Xiaozhi Firmware
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build ESP-IDF
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.3
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Clean and update dependencies
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          # Remove the managed_components directory to force fresh install
+          rm -rf managed_components dependencies.lock
+          # Update component manager cache
+          idf.py update-dependencies
+
+      - name: Build project for ESP32-S3
+        shell: bash
+        run: |
+              . $IDF_PATH/export.sh
+              idf.py set-target esp32s3
+              idf.py build 
+              cd build
+              esptool.py --chip esp32s3 merge_bin -o xiaozhi_merged.bin @flash_args
+      
+      - name: Store Firmware (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+              name: xiaozhi-firmware-esp32s3
+              # Cập nhật đường dẫn để chỉ lưu trữ file đã được gộp hoàn chỉnh
+              path: build/xiaozhi_merged.bin
