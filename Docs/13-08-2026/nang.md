@@ -9,5 +9,5 @@
 2. đẩy code
 trước khi add thì git fetch là cập nhật, sau fetch là git pull origin main, tiếp theo là git add.
 git commit -m "test commit"
-git push origin main
+git push origin (ten nhanh)
 iwgigfigefig
